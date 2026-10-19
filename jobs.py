@@ -56,6 +56,74 @@ SALARY_VALUES = {
 }
 
 REMOTE_RE = re.compile(r"удал|дистанц", re.I)
+
+# --- фильтр подозрительных вакансий (те же принципы, что в ежедневном посте) ---
+SCAM_RE = re.compile(
+    r"вложени|предоплат|оплат\S* (за )?обучени|платн\S* обучени|взнос|депозит|(?<![а-яё])крипт|"
+    r"инвестиц|ставк\S* на спорт|пассивн\S* доход|л[её]гк\S* (заработ|деньг)|от имени девуш|"
+    r"переписк\S* с мужч|сетев\S* маркетинг|\bmlm\b|выкуп\S* товар|отзыв\S* (на|для) маркетплейс|"
+    r"ставить (лайк|оценк)|наборщик|набор текст|перепечат|без вложений|выплаты? каждый день|"
+    r"ежедневн\S* выплат", re.I)
+IP_RE = re.compile(r"^(ИП|ИНДИВИДУАЛЬН\S* ПРЕДПРИНИМ\S*)(\s|$)", re.I)
+SIMPLE_ROLE_RE = re.compile(
+    r"оператор|ввод\S* данных|модератор|ассистент|помощник|чат|администратор(?! веб| сайт| систем)|"
+    r"риел?тор|менеджер по работе с клиентами|диспетчер|курьер|подбор", re.I)
+REPOST_RE = re.compile(r"^\s*Вакансия компании:", re.I)
+
+
+def _desc_key(job: dict) -> str:
+    return re.sub(r"[^а-яёa-z]", "", (job.get("description") or "").lower())[:150]
+
+
+def filter_suspicious(jobs: list) -> list:
+    """Убрать подозрительные вакансии. Если у работодателя нашлась хоть одна
+    подозрительная — убираем все его вакансии."""
+    bad_companies, flagged = set(), set()
+    for j in jobs:
+        text = f"{j['title']} {j.get('description', '')}"
+        company = j.get("company", "")
+        lo = j.get("salary_min") or 0
+        hi = max(lo, j.get("salary_max") or 0)
+        is_ip = bool(IP_RE.search(company))
+        reason = None
+        if SCAM_RE.search(text):
+            reason = "схема/оплата/крипта"
+        elif is_ip and REPOST_RE.search(j.get("description", "")):
+            reason = "ИП публикует вакансии чужих компаний"
+        elif is_ip and SIMPLE_ROLE_RE.search(j["title"]) and hi >= 70000:
+            reason = "ИП, простая работа, зарплата выше рынка"
+        elif lo >= 150000 and j.get("experience", 0) == 0:
+            reason = "нереальная зарплата без опыта"
+        elif lo and hi >= 200000 and hi >= 3 * lo:
+            reason = "вилка «до 350 000» — оплата только с продаж"
+        if reason:
+            flagged.add(j["id"])
+            if company:
+                bad_companies.add(company)
+            logger.info(f"filtered: {j['title']} / {company} — {reason}")
+
+    # массовые объявления: один работодатель, один текст, 3+ разных названия
+    groups = {}
+    for j in jobs:
+        if REPOST_RE.search(j.get("description", "")):
+            continue
+        groups.setdefault((j.get("company", ""), _desc_key(j)), set()).add(j["title"])
+    for (company, _), titles in groups.items():
+        if len(titles) >= 3 and company:
+            bad_companies.add(company)
+            logger.info(f"filtered company (mass ads): {company}")
+
+    out, seen = [], set()
+    for j in jobs:
+        if j["id"] in flagged or j.get("company", "") in bad_companies:
+            continue
+        k = _desc_key(j)
+        if k and k in seen:          # одинаковый текст — показываем один раз
+            continue
+        seen.add(k)
+        out.append(j)
+    return out
+
 MAX_AGE_DAYS = 45          # старше — не показываем
 CACHE_TTL = 30 * 60        # кэш результатов по категории, сек
 
@@ -110,6 +178,9 @@ class JobsFetcher:
             seen.update({j["id"], key})
             uniq.append(j)
         uniq.sort(key=lambda j: j["date"], reverse=True)
+        before = len(uniq)
+        uniq = filter_suspicious(uniq)
+        logger.info(f"suspicious filter: {before} -> {len(uniq)}")
 
         if uniq:   # пустой результат не кэшируем — вдруг временный сбой
             self._cache[category] = (time.time(), uniq)
@@ -175,6 +246,7 @@ class JobsFetcher:
             "url":         v.get("vac_url", "https://trudvsem.ru"),
             "date":        v.get("creation-date", ""),
             "source":      "Работа России",
+            "experience":  (v.get("requirement") or {}).get("experience") or 0,
         }
 
     def _parse_hh(self, item: dict) -> dict:

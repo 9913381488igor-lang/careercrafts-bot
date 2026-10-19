@@ -11,6 +11,8 @@ from jobs import JobsFetcher
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+# httpx пишет в лог каждый запрос вместе с токеном бота — оставляем только предупреждения
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CHOOSE_CATEGORY, CHOOSE_SALARY, CHOOSE_FORMAT, CONFIRM = range(4)
 
@@ -231,7 +233,13 @@ def main():
     from config import BOT_TOKEN, JOB_SEND_INTERVAL_HOURS
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-    db = Database("users.db")
+    import os
+    db_path = os.environ.get("DB_PATH", "users.db")   # на Railway: /data/users.db (Volume)
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    db = Database(db_path)
+    logger.info(f"База подписчиков: {db_path}")
     fetcher = JobsFetcher()
 
     async def post_init(application: Application):
