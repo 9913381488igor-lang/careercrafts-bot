@@ -256,7 +256,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отправлено вакансий: {sent}\n\n"
         f"Популярные специализации:\n{top}\n\nОткуда пришли:\n"
         + ("\n".join(f"  • {s}: {n}" for s, n in srcs) or "  —"),
-        reply_markup=main_keyboard(True, True))
+        reply_markup=main_keyboard(bool((db.get_user(update.effective_user.id) or {}).get("active", True)), True))
 
 
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
