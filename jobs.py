@@ -124,6 +124,7 @@ def filter_suspicious(jobs: list) -> list:
         out.append(j)
     return out
 
+MIN_MONTHLY_SALARY = 15000 # без зарплаты или меньше — не показываем
 MAX_AGE_DAYS = 45          # старше — не показываем
 CACHE_TTL = 30 * 60        # кэш результатов по категории, сек
 
@@ -143,6 +144,8 @@ class JobsFetcher:
         """Вернуть (список вакансий, текст ошибки или None)."""
         sal_min = SALARY_VALUES.get(salary)
         jobs, errors = self._pool(category)
+        # зарплата должна быть указана и похожа на месячную (отсекаем «4 500 ₽» за смену и т.п.)
+        jobs = [j for j in jobs if max(j["salary_min"] or 0, j["salary_max"] or 0) >= MIN_MONTHLY_SALARY]
         if sal_min:
             jobs = [j for j in jobs if (j["salary_max"] or j["salary_min"] or 0) >= sal_min]
         error = None
