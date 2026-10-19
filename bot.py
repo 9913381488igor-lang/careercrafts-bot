@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -26,14 +27,38 @@ FORMATS = ["Полная удалёнка", "Гибрид", "Любой форм
 
 
 def format_job(job: dict) -> str:
+    e = lambda x: html.escape(str(x or ""))
+    desc = (job.get("description") or "").strip()
+    if len(desc) > 300:
+        desc = desc[:300].rsplit(" ", 1)[0] + "…"
     return (
-        f"💼 *{job['title']}*\n"
-        f"🏢 {job.get('company', '')}\n"
-        f"💰 {job.get('salary', 'не указана')}\n"
-        f"🏠 {job.get('format', 'Удалёнка')}\n\n"
-        f"{job.get('description', '')[:200]}...\n\n"
-        f"👉 [Открыть вакансию]({job['url']})"
+        f"💼 <b>{e(job['title'])}</b>\n"
+        f"🏢 {e(job.get('company'))}\n"
+        f"💰 <b>{e(job.get('salary', 'не указана'))}</b>\n"
+        f"🏠 {e(job.get('format', 'Удалёнка'))}\n\n"
+        + (f"{e(desc)}\n\n" if desc else "")
+        + f'👉 <a href="{e(job["url"])}">Открыть вакансию</a>'
+        + (f"  ·  {e(job['source'])}" if job.get("source") else "")
     )
+
+
+ERROR_TEXT = ("⚠️ Сейчас не удалось получить вакансии — источник временно недоступен. "
+              "Попробуй через 10–15 минут: /latest")
+EMPTY_TEXT = ("Свежих удалённых вакансий по твоим настройкам пока нет. "
+              "Попробуй выбрать «Любая зарплата» или другую специализацию: /start")
+
+
+async def get_jobs(context_or_app, user: dict):
+    """Поиск в отдельном потоке, чтобы бот не «зависал» на время запросов."""
+    fetcher = context_or_app.bot_data["fetcher"]
+    return await asyncio.to_thread(fetcher.fetch, user["category"], user["salary"])
+
+
+async def send_jobs(bot, chat_id: int, jobs: list, limit: int = 5):
+    for job in jobs[:limit]:
+        await bot.send_message(chat_id=chat_id, text=format_job(job), parse_mode="HTML",
+                               disable_web_page_preview=True)
+        await asyncio.sleep(0.1)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,19 +163,22 @@ async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data["db"]
-    fetcher = context.bot_data["fetcher"]
     user = db.get_user(update.effective_user.id)
     if not user:
         await update.message.reply_text("Сначала настрой подписку: /start")
         return
-    await update.message.reply_text("🔍 Ищу вакансии...")
-    jobs = fetcher.fetch(user["category"], user["salary"])
-    if not jobs:
-        await update.message.reply_text("Пока новых вакансий нет. Загляни позже!")
+    await update.message.reply_text("🔍 Ищу вакансии... это может занять до минуты")
+    jobs, error = await get_jobs(context, user)
+    if error:
+        logger.error(f"/latest for {user['user_id']}: {error}")
+        await update.message.reply_text(ERROR_TEXT)
         return
+    if not jobs:
+        await update.message.reply_text(EMPTY_TEXT)
+        return
+    await send_jobs(context.bot, update.effective_user.id, jobs)
     for job in jobs[:5]:
-        await update.message.reply_text(format_job(job), parse_mode="Markdown",
-                                        disable_web_page_preview=True)
+        db.mark_job_sent(user["user_id"], job["id"])
 
 
 async def pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -164,29 +192,39 @@ async def latest_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     db = context.bot_data["db"]
-    fetcher = context.bot_data["fetcher"]
     user = db.get_user(update.effective_user.id)
-    jobs = fetcher.fetch(user["category"], user["salary"])
-    await query.edit_message_text("📋 Отправляю последние вакансии...")
-    for job in (jobs or [])[:5]:
-        await context.bot.send_message(
-            chat_id=update.effective_user.id, text=format_job(job),
-            parse_mode="Markdown", disable_web_page_preview=True)
+    if not user:
+        await query.edit_message_text("Сначала настрой подписку: /start")
+        return
+    await query.edit_message_text("🔍 Ищу вакансии... это может занять до минуты")
+    jobs, error = await get_jobs(context, user)
+    if error:
+        await context.bot.send_message(update.effective_user.id, ERROR_TEXT)
+        return
+    if not jobs:
+        await context.bot.send_message(update.effective_user.id, EMPTY_TEXT)
+        return
+    await send_jobs(context.bot, update.effective_user.id, jobs)
 
 
 async def broadcast(app: Application):
     db = app.bot_data["db"]
-    fetcher = app.bot_data["fetcher"]
     for user in db.get_all_active_users():
         try:
-            jobs = db.filter_new_jobs(user["user_id"], fetcher.fetch(user["category"], user["salary"]))
-            for job in jobs[:3]:
-                await app.bot.send_message(chat_id=user["user_id"], text=format_job(job),
-                                           parse_mode="Markdown", disable_web_page_preview=True)
+            jobs, error = await get_jobs(app, user)
+            if error:
+                logger.error(f"Broadcast fetch error for {user['user_id']}: {error}")
+                continue
+            new = db.filter_new_jobs(user["user_id"], jobs)
+            await send_jobs(app.bot, user["user_id"], new, limit=3)
+            for job in new[:3]:
                 db.mark_job_sent(user["user_id"], job["id"])
-                await asyncio.sleep(0.1)
         except Exception as e:
             logger.error(f"Broadcast error for {user['user_id']}: {e}")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
 
 def main():
@@ -196,7 +234,15 @@ def main():
     db = Database("users.db")
     fetcher = JobsFetcher()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application: Application):
+        from datetime import datetime, timedelta
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(broadcast, "interval", hours=JOB_SEND_INTERVAL_HOURS, args=[application],
+                          next_run_time=datetime.now() + timedelta(minutes=2))
+        scheduler.start()
+        application.bot_data["scheduler"] = scheduler
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.bot_data["db"] = db
     app.bot_data["fetcher"] = fetcher
 
@@ -221,12 +267,9 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(pause_cb,  pattern="^pause$"))
     app.add_handler(CallbackQueryHandler(latest_cb, pattern="^latest$"))
+    app.add_error_handler(on_error)
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(broadcast, "interval", hours=JOB_SEND_INTERVAL_HOURS, args=[app])
-    scheduler.start()
-
-    logger.info("Бот запущен!")
+    logger.info(f"Бот запущен! hh.ru: {'включён (HH_TOKEN)' if fetcher.hh_token else 'выключен — нет HH_TOKEN'}")
     app.run_polling()
 
 
