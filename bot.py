@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import html
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -34,12 +35,19 @@ BTN_PAUSE = "⏸ Пауза"
 BTN_RESUME = "▶️ Возобновить"
 BTN_CHANNEL = "📢 Наш канал"
 CHANNEL_URL = "https://t.me/careercrafts"
+BTN_STATS = "📊 Статистика"
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "457704932"))   # кто видит статистику
 
 
-def main_keyboard(active: bool = True) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[BTN_LATEST], [BTN_SETTINGS, BTN_PAUSE if active else BTN_RESUME], [BTN_CHANNEL]],
-        resize_keyboard=True, is_persistent=True)
+def main_keyboard(active: bool = True, admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [[BTN_LATEST], [BTN_SETTINGS, BTN_PAUSE if active else BTN_RESUME], [BTN_CHANNEL]]
+    if admin:
+        rows.append([BTN_STATS])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def is_admin(update: Update) -> bool:
+    return bool(update.effective_user) and update.effective_user.id == ADMIN_ID
 
 
 def format_job(job: dict) -> str:
@@ -86,7 +94,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 С возвращением, {name}! "
             + ("Ты подписан на вакансии." if user.get("active") else "Рассылка на паузе.")
             + "\n\nКнопки управления — внизу 👇",
-            reply_markup=main_keyboard(bool(user.get("active"))))
+            reply_markup=main_keyboard(bool(user.get("active")), is_admin(update)))
     else:
         kb = [[InlineKeyboardButton("🚀 Настроить подписку", callback_data="setup")]]
         await update.message.reply_text(
@@ -162,7 +170,7 @@ async def confirm_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pause — пауза\n/resume — возобновить\n/latest — вакансии сейчас",
         parse_mode="Markdown")
     await context.bot.send_message(update.effective_user.id, "Кнопки управления — внизу 👇",
-                                   reply_markup=main_keyboard(True))
+                                   reply_markup=main_keyboard(True, is_admin(update)))
     return ConversationHandler.END
 
 
@@ -180,15 +188,38 @@ async def channel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Перейти в канал", url=CHANNEL_URL)]]))
 
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    db = context.bot_data["db"]
+    with db._conn() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
+        today = conn.execute("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', 'start of day')").fetchone()[0]
+        week = conn.execute("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')").fetchone()[0]
+        sent = conn.execute("SELECT COUNT(*) FROM sent_jobs").fetchone()[0]
+        cats = conn.execute("SELECT category, COUNT(*) FROM users GROUP BY category ORDER BY 2 DESC LIMIT 3").fetchall()
+    top = "\n".join(f"  • {c or '—'}: {n}" for c, n in cats) or "  —"
+    await update.message.reply_text(
+        f"📊 Статистика бота\n\n"
+        f"Подписчиков всего: {total}\n"
+        f"Активных (не на паузе): {active}\n"
+        f"Новых сегодня: {today}\n"
+        f"Новых за 7 дней: {week}\n"
+        f"Отправлено вакансий: {sent}\n\n"
+        f"Популярные специализации:\n{top}",
+        reply_markup=main_keyboard(True, True))
+
+
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["db"].set_active(update.effective_user.id, False)
     await update.message.reply_text("⏸ Рассылка приостановлена. Нажми «▶️ Возобновить», когда захочешь снова получать вакансии.",
-                                    reply_markup=main_keyboard(False))
+                                    reply_markup=main_keyboard(False, is_admin(update)))
 
 
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["db"].set_active(update.effective_user.id, True)
-    await update.message.reply_text("▶️ Рассылка возобновлена!", reply_markup=main_keyboard(True))
+    await update.message.reply_text("▶️ Рассылка возобновлена!", reply_markup=main_keyboard(True, is_admin(update)))
 
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,6 +343,8 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_PAUSE]), pause))
     app.add_handler(MessageHandler(filters.Text([BTN_RESUME]), resume))
     app.add_handler(MessageHandler(filters.Text([BTN_CHANNEL]), channel_msg))
+    app.add_handler(MessageHandler(filters.Text([BTN_STATS]), stats))
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(pause_cb,  pattern="^pause$"))
     app.add_handler(CallbackQueryHandler(latest_cb, pattern="^latest$"))
     app.add_error_handler(on_error)
