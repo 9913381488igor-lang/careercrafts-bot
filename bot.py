@@ -2,6 +2,7 @@ import logging
 import asyncio
 import html
 import os
+from urllib.parse import urlencode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -36,14 +37,43 @@ BTN_RESUME = "▶️ Возобновить"
 BTN_CHANNEL = "📢 Наш канал"
 CHANNEL_URL = "https://t.me/careercrafts"
 BTN_STATS = "📊 Статистика"
+BTN_INVITE = "🎁 Пригласить друга"
+BOT_LINK = "https://t.me/careercrafts_jobs_bot"
+BOT_NAME = "Удалёнка: вакансии без опыта"
+BOT_SHORT = "Удалённые вакансии с зарплатой под ваш запрос. Можно без опыта. Бесплатно."
+BOT_DESCRIPTION = (
+    "🔎 Присылаю удалённые вакансии с указанной зарплатой — под вашу специальность и желаемый доход.\n\n"
+    "✅ Можно без опыта\n✅ Только полная удалёнка\n✅ Отсеиваю подозрительные вакансии\n✅ Бесплатно\n\n"
+    "Нажмите «Старт» — настройка займёт 1 минуту.\nЕжедневные подборки — в канале @careercrafts")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "457704932"))   # кто видит статистику
 
 
 def main_keyboard(active: bool = True, admin: bool = False) -> ReplyKeyboardMarkup:
-    rows = [[BTN_LATEST], [BTN_SETTINGS, BTN_PAUSE if active else BTN_RESUME], [BTN_CHANNEL]]
+    rows = [[BTN_LATEST], [BTN_SETTINGS, BTN_PAUSE if active else BTN_RESUME], [BTN_INVITE, BTN_CHANNEL]]
     if admin:
         rows.append([BTN_STATS])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def share_markup(job: dict) -> InlineKeyboardMarkup:
+    text = f"Удалённая вакансия: {job['title']} — {job.get('salary', '')}. Бот присылает такие под твой запрос 👉"
+    url = "https://t.me/share/url?" + urlencode({"url": f"{BOT_LINK}?start=share", "text": text})
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📤 Поделиться с другом", url=url)]])
+
+
+def ensure_source_column(db):
+    with db._conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+        if "source" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN source TEXT")
+            conn.commit()
+
+
+def save_source(db, user_id: int, source):
+    with db._conn() as conn:
+        conn.execute("UPDATE users SET source=? WHERE user_id=? AND source IS NULL",
+                     (source or "direct", user_id))
+        conn.commit()
 
 
 def is_admin(update: Update) -> bool:
@@ -81,7 +111,7 @@ async def get_jobs(context_or_app, user: dict):
 async def send_jobs(bot, chat_id: int, jobs: list, limit: int = 5):
     for job in jobs[:limit]:
         await bot.send_message(chat_id=chat_id, text=format_job(job), parse_mode="HTML",
-                               disable_web_page_preview=True)
+                               disable_web_page_preview=True, reply_markup=share_markup(job))
         await asyncio.sleep(0.1)
 
 
@@ -89,6 +119,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data["db"]
     user = db.get_user(update.effective_user.id)
     name = update.effective_user.first_name or "друг"
+    if context.args:   # метка источника из ссылки t.me/бот?start=...
+        context.user_data["source"] = context.args[0][:64]
     if user:
         await update.message.reply_text(
             f"👋 С возвращением, {name}! "
@@ -164,6 +196,7 @@ async def confirm_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "name": update.effective_user.first_name or "",
         **{k: context.user_data[k] for k in ["category", "salary", "format"]}
     })
+    save_source(db, update.effective_user.id, context.user_data.get("source"))
     await query.edit_message_text(
         "🎉 *Подписка активирована!*\n\n"
         "Буду присылать подходящие вакансии автоматически.\n\n"
@@ -188,6 +221,16 @@ async def channel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Перейти в канал", url=CHANNEL_URL)]]))
 
 
+async def invite_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link = f"{BOT_LINK}?start=ref_{update.effective_user.id}"
+    text = "Бот присылает удалённые вакансии с зарплатой под твой запрос — бесплатно 👉"
+    url = "https://t.me/share/url?" + urlencode({"url": link, "text": text})
+    await update.message.reply_text(
+        f"🎁 Поделись ботом с друзьями, которые ищут удалёнку!\n\nТвоя личная ссылка:\n{link}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📤 Отправить другу", url=url)]]),
+        disable_web_page_preview=True)
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -199,6 +242,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         week = conn.execute("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')").fetchone()[0]
         sent = conn.execute("SELECT COUNT(*) FROM sent_jobs").fetchone()[0]
         cats = conn.execute("SELECT category, COUNT(*) FROM users GROUP BY category ORDER BY 2 DESC LIMIT 3").fetchall()
+        srcs = conn.execute(
+            "SELECT CASE WHEN source LIKE 'ref_%' THEN 'приглашения друзей' "
+            "ELSE COALESCE(source, 'до учёта источников') END s, COUNT(*) "
+            "FROM users GROUP BY s ORDER BY 2 DESC LIMIT 6").fetchall()
     top = "\n".join(f"  • {c or '—'}: {n}" for c, n in cats) or "  —"
     await update.message.reply_text(
         f"📊 Статистика бота\n\n"
@@ -207,7 +254,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Новых сегодня: {today}\n"
         f"Новых за 7 дней: {week}\n"
         f"Отправлено вакансий: {sent}\n\n"
-        f"Популярные специализации:\n{top}",
+        f"Популярные специализации:\n{top}\n\nОткуда пришли:\n"
+        + ("\n".join(f"  • {s}: {n}" for s, n in srcs) or "  —"),
         reply_markup=main_keyboard(True, True))
 
 
@@ -299,6 +347,7 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
     db = Database(db_path)
     logger.info(f"База подписчиков: {db_path}")
+    ensure_source_column(db)
     fetcher = JobsFetcher()
 
     async def post_init(application: Application):
@@ -314,6 +363,13 @@ def main():
             BotCommand("pause", "Приостановить рассылку"),
             BotCommand("resume", "Возобновить рассылку"),
         ])
+        try:
+            if (await application.bot.get_my_name()).name != BOT_NAME:
+                await application.bot.set_my_name(BOT_NAME)
+            await application.bot.set_my_short_description(BOT_SHORT)
+            await application.bot.set_my_description(BOT_DESCRIPTION)
+        except Exception as e:
+            logger.warning(f"Не удалось обновить имя/описание бота: {e}")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.bot_data["db"] = db
@@ -343,6 +399,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text([BTN_PAUSE]), pause))
     app.add_handler(MessageHandler(filters.Text([BTN_RESUME]), resume))
     app.add_handler(MessageHandler(filters.Text([BTN_CHANNEL]), channel_msg))
+    app.add_handler(MessageHandler(filters.Text([BTN_INVITE]), invite_msg))
     app.add_handler(MessageHandler(filters.Text([BTN_STATS]), stats))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(pause_cb,  pattern="^pause$"))
