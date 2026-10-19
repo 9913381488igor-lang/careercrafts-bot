@@ -1,10 +1,10 @@
 import logging
 import asyncio
 import html
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler
+    ContextTypes, ConversationHandler, MessageHandler, filters
 )
 from database import Database
 from jobs import JobsFetcher
@@ -26,6 +26,20 @@ SALARY_RANGES = [
     "от 80 000 ₽", "от 120 000 ₽", "от 200 000 ₽"
 ]
 FORMATS = ["Полная удалёнка", "Гибрид", "Любой формат"]
+
+# Кнопки внизу экрана (постоянная клавиатура)
+BTN_LATEST = "📋 Вакансии сейчас"
+BTN_SETTINGS = "⚙️ Настройки"
+BTN_PAUSE = "⏸ Пауза"
+BTN_RESUME = "▶️ Возобновить"
+BTN_CHANNEL = "📢 Наш канал"
+CHANNEL_URL = "https://t.me/careercrafts"
+
+
+def main_keyboard(active: bool = True) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BTN_LATEST], [BTN_SETTINGS, BTN_PAUSE if active else BTN_RESUME], [BTN_CHANNEL]],
+        resize_keyboard=True, is_persistent=True)
 
 
 def format_job(job: dict) -> str:
@@ -67,15 +81,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data["db"]
     user = db.get_user(update.effective_user.id)
     name = update.effective_user.first_name or "друг"
-    if user and user.get("active"):
-        kb = [
-            [InlineKeyboardButton("⚙️ Изменить настройки", callback_data="setup")],
-            [InlineKeyboardButton("⏸ Приостановить", callback_data="pause")],
-            [InlineKeyboardButton("📋 Последние вакансии", callback_data="latest")],
-        ]
+    if user:
         await update.message.reply_text(
-            f"👋 С возвращением, {name}! Ты подписан на вакансии.",
-            reply_markup=InlineKeyboardMarkup(kb))
+            f"👋 С возвращением, {name}! "
+            + ("Ты подписан на вакансии." if user.get("active") else "Рассылка на паузе.")
+            + "\n\nКнопки управления — внизу 👇",
+            reply_markup=main_keyboard(bool(user.get("active"))))
     else:
         kb = [[InlineKeyboardButton("🚀 Настроить подписку", callback_data="setup")]]
         await update.message.reply_text(
@@ -150,17 +161,34 @@ async def confirm_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Буду присылать подходящие вакансии автоматически.\n\n"
         "/pause — пауза\n/resume — возобновить\n/latest — вакансии сейчас",
         parse_mode="Markdown")
+    await context.bot.send_message(update.effective_user.id, "Кнопки управления — внизу 👇",
+                                   reply_markup=main_keyboard(True))
     return ConversationHandler.END
+
+
+async def settings_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = [[InlineKeyboardButton(c, callback_data=f"cat_{i}")] for i, c in enumerate(CATEGORIES)]
+    await update.message.reply_text(
+        "📂 *Шаг 1/3: Специализация*", parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons))
+    return CHOOSE_CATEGORY
+
+
+async def channel_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Свежие подборки удалённых вакансий каждый день — в канале «Удаленка для тебя» 👇",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Перейти в канал", url=CHANNEL_URL)]]))
 
 
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["db"].set_active(update.effective_user.id, False)
-    await update.message.reply_text("⏸ Рассылка приостановлена. /resume чтобы возобновить.")
+    await update.message.reply_text("⏸ Рассылка приостановлена. Нажми «▶️ Возобновить», когда захочешь снова получать вакансии.",
+                                    reply_markup=main_keyboard(False))
 
 
 async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["db"].set_active(update.effective_user.id, True)
-    await update.message.reply_text("▶️ Рассылка возобновлена!")
+    await update.message.reply_text("▶️ Рассылка возобновлена!", reply_markup=main_keyboard(True))
 
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,13 +277,20 @@ def main():
                           next_run_time=datetime.now() + timedelta(minutes=2))
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
+        await application.bot.set_my_commands([
+            BotCommand("start", "Главное меню"),
+            BotCommand("latest", "Вакансии сейчас"),
+            BotCommand("pause", "Приостановить рассылку"),
+            BotCommand("resume", "Возобновить рассылку"),
+        ])
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.bot_data["db"] = db
     app.bot_data["fetcher"] = fetcher
 
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(setup_start, pattern="^setup$")],
+        entry_points=[CallbackQueryHandler(setup_start, pattern="^setup$"),
+                      MessageHandler(filters.Text([BTN_SETTINGS]), settings_msg)],
         states={
             CHOOSE_CATEGORY: [CallbackQueryHandler(choose_category, pattern="^cat_")],
             CHOOSE_SALARY:   [CallbackQueryHandler(choose_salary,   pattern="^sal_")],
@@ -273,6 +308,10 @@ def main():
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("latest", latest))
     app.add_handler(conv)
+    app.add_handler(MessageHandler(filters.Text([BTN_LATEST]), latest))
+    app.add_handler(MessageHandler(filters.Text([BTN_PAUSE]), pause))
+    app.add_handler(MessageHandler(filters.Text([BTN_RESUME]), resume))
+    app.add_handler(MessageHandler(filters.Text([BTN_CHANNEL]), channel_msg))
     app.add_handler(CallbackQueryHandler(pause_cb,  pattern="^pause$"))
     app.add_handler(CallbackQueryHandler(latest_cb, pattern="^latest$"))
     app.add_error_handler(on_error)
